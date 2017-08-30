@@ -182,6 +182,7 @@ type SQLiteTx struct {
 
 // SQLiteStmt implement sql.Stmt.
 type SQLiteStmt struct {
+	mu     sync.Mutex
 	c      *SQLiteConn
 	s      *C.sqlite3_stmt
 	t      string
@@ -197,6 +198,7 @@ type SQLiteResult struct {
 
 // SQLiteRows implement sql.Rows.
 type SQLiteRows struct {
+	mu       sync.Mutex
 	s        *SQLiteStmt
 	nc       int
 	cols     []string
@@ -757,14 +759,20 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 
 // Close the connection.
 func (c *SQLiteConn) Close() error {
+	if c.db == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db == nil {
+		return nil
+	}
 	rv := C.sqlite3_close_v2(c.db)
 	if rv != C.SQLITE_OK {
 		return c.lastError()
 	}
 	deleteHandles(c)
-	c.mu.Lock()
 	c.db = nil
-	c.mu.Unlock()
 	runtime.SetFinalizer(c, nil)
 	return nil
 }
@@ -803,6 +811,11 @@ func (c *SQLiteConn) prepare(ctx context.Context, query string) (driver.Stmt, er
 
 // Close the statement.
 func (s *SQLiteStmt) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
@@ -980,20 +993,27 @@ func (s *SQLiteStmt) exec(ctx context.Context, args []namedValue) (driver.Result
 
 // Close the rows.
 func (rc *SQLiteRows) Close() error {
-	if rc.s.closed || rc.closed {
+	if rc.closed {
 		return nil
 	}
-	rc.closed = true
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	if rc.closed {
+		return nil
+	}
 	if rc.done != nil {
 		close(rc.done)
 	}
 	if rc.cls {
-		return rc.s.Close()
+		err := rc.s.Close()
+		rc.closed = true
+		return err
 	}
 	rv := C.sqlite3_reset(rc.s.s)
 	if rv != C.SQLITE_OK {
 		return rc.s.c.lastError()
 	}
+	rc.closed = true
 	return nil
 }
 
