@@ -68,7 +68,13 @@ CREATE TABLE IF NOT EXISTS test_table (
 	data      BLOB        NOT NULL
 );`,
 	}
-	letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+)
+
+const (
+	letterBytes   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	sqliteAddress = "file::memory:?mode=memory&cache=shared"
+	rowCount      = 10000
+	testCount     = 20000
 )
 
 func randStringBytes(n int) string {
@@ -87,11 +93,19 @@ func initDatabase(t *testing.T, db *sql.DB, rowCount int64) {
 			t.Fatal(err)
 		}
 	}
+	query := `INSERT INTO test_table
+		(key1, key_id, key2, key3, key4, key5, key6, data)
+		VALUES
+		(?, ?, ?, ?, ?, ?, ?, ?);`
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(query)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := int64(0); i < rowCount; i++ {
-		query := `INSERT INTO test_table
-			(key1, key_id, key2, key3, key4, key5, key6, data)
-			VALUES
-			(?, ?, ?, ?, ?, ?, ?, ?);`
 		args := []interface{}{
 			randStringBytes(50),
 			fmt.Sprint(i),
@@ -100,43 +114,86 @@ func initDatabase(t *testing.T, db *sql.DB, rowCount int64) {
 			randStringBytes(50),
 			randStringBytes(50),
 			randStringBytes(50),
-			randStringBytes(50),
 			randStringBytes(2048),
 		}
-		_, err := db.Exec(query, args...)
+		_, err := stmt.Exec(args...)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
+	err = tx.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestShortTimeout(t *testing.T) {
-	db, err := sql.Open("sqlite3", "file::memory:?mode=memory&cache=shared")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	initDatabase(t, db, 10000)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Microsecond)
+func runQueryContext(t *testing.T, db *sql.DB, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	query := `SELECT key1, key_id, key2, key3, key4, key5, key6, data
-		FROM test_table
-		ORDER BY key2 ASC`
+	query := "SELECT key1, key_id, key2, key3, key4, key5, key6, data FROM test_table"
 	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer rows.Close()
+	if err != nil {
+		return err
+	}
+	count := 0
 	for rows.Next() {
 		var key1, keyid, key2, key3, key4, key5, key6 string
 		var data []byte
 		err = rows.Scan(&key1, &keyid, &key2, &key3, &key4, &key5, &key6, &data)
 		if err != nil {
-			break
+			return err
+		}
+		count++
+	}
+	err = rows.Err()
+	if err != nil {
+		return err
+	}
+	if count != rowCount {
+		t.Fatal("unexpected row count")
+	}
+	return nil
+}
+
+func getMaxTimeout(t *testing.T, db *sql.DB) int64 {
+	nilCount := 0
+	errCount := 0
+	for i := 1; i <= 60; i++ {
+		timeout := time.Duration(int64(1)<<uint(i)) * time.Nanosecond
+		err := runQueryContext(t, db, timeout)
+		if err == nil {
+			nilCount++
+		} else {
+			if err != context.DeadlineExceeded {
+				t.Fatal(err)
+			}
+			errCount++
+		}
+		if nilCount > 0 {
+			if errCount == 0 {
+				t.Fatal("execution time shorter than expected")
+			}
+			return int64(1) << uint(i)
 		}
 	}
-	if context.DeadlineExceeded != ctx.Err() {
-		t.Fatal(ctx.Err())
+	t.Fatal("execution time is longer than expected")
+	return 0
+}
+
+func TestQueryContext(t *testing.T) {
+	db, err := sql.Open("sqlite3", sqliteAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	initDatabase(t, db, rowCount)
+	maxTimeout := getMaxTimeout(t, db)
+	for i := 0; i < testCount; i++ {
+		timeout := time.Duration(rand.Int63n(maxTimeout)) * time.Nanosecond
+		err := runQueryContext(t, db, timeout)
+		if (err != nil) && (err != context.DeadlineExceeded) {
+			t.Fatal(err)
+		}
 	}
 }
