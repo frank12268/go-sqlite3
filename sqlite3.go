@@ -1132,3 +1132,81 @@ func (rc *SQLiteRows) Next(dest []driver.Value) error {
 	}
 	return nil
 }
+
+/*
+When using db.QueryContext, rows.Close() and rows.Next() can be called simultaneously (by timeout context and main routine respectively).
+If the (*SQLiteRows / *SQLiteStmt / *C.sqlite3_stmt) gets released by rows.Close() firstly, but rows.Next() is still using it, we will got runtime error.
+FixedSQLiteRows & fixedDBQueryContext are introduced to avoid using released resources by dealing with timeout and next sequentially.
+*/
+type FixedSQLiteRows struct {
+	*sql.Rows
+	ctx            context.Context
+	fixedCtxCancel context.CancelFunc
+	once           sync.Once
+	queryId        int
+	first          bool
+}
+
+func (rc *FixedSQLiteRows) Next() bool {
+	select {
+	case <-rc.ctx.Done():
+		//logrus.Infof("[%06d] next ctx.Done", rc.queryId)
+		return false
+	default:
+		/*
+		if rc.first {
+			rc.first = false
+			logrus.Infof("[%06d] next", rc.queryId)
+		}
+		*/
+	}
+	return rc.Rows.Next()
+}
+func (rc *FixedSQLiteRows) Close() error {
+	defer rc.fixedCtxCancel()
+	//logrus.Infof("[%06d] close", rc.queryId)
+	return rc.Rows.Close()
+}
+
+func fixedDBQueryContext(ctx context.Context, queryId int, db *sql.DB, query string, args ...interface{}) (*FixedSQLiteRows, error) {
+	//logrus.Infof("========fixedDBQueryContext %06d========", queryId)
+	fixedCtx, fixedCtxCancel := context.WithCancel(context.Background())
+	pauseChan := make(chan struct{})
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-ctx.Done():
+			//logrus.Infof("[%06d] go ctx.Done", queryId)
+			//fixedCtxCancel()
+			//logrus.Infof("[%06d] go fixedCtxCancel done, err = %v", queryId, ctx.Err())
+		case <-pauseChan:
+			//logrus.Infof("[%06d] go pauseChan", queryId)
+		}
+	}()
+	rows, err := db.QueryContext(fixedCtx, query, args...)
+	select {
+	case pauseChan <- struct{}{}:
+		//logrus.Infof("[%06d] send pauseChan", queryId)
+	default:
+		<-ctx.Done()
+		err = ctx.Err()
+		//logrus.Infof("[%06d] send pauseChan failed, err = %v", queryId, err)
+	}
+	if err != nil {
+		//logrus.Infof("rows creation failed, err = %v", err)
+		fixedCtxCancel()
+		return nil, err
+	}
+	fixedRows := &FixedSQLiteRows{
+		Rows:           rows,
+		ctx:            ctx,
+		fixedCtxCancel: fixedCtxCancel,
+		queryId:        queryId,
+		first:          true,
+	}
+	wg.Wait()
+	return fixedRows, nil
+}
+
